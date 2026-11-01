@@ -2,9 +2,15 @@
 
 import hashlib
 import json
+import os
+import platform
+import shutil
+import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
+from urllib.parse import urlparse
 
 from browser_harness.admin import ensure_daemon
 from browser_harness.helpers import cdp
@@ -13,12 +19,76 @@ from browser_harness.helpers import cdp
 READ_STATE = Path(__file__).with_name("snapshot.js").read_text()
 MARKER = f"(() => {{ const state={READ_STATE}; return state?.marker ?? null; }})()"
 
+# Dedicated, logged-out Chrome profile for BU_CDP_URL. Kept off the user's real
+# profile dirs so automation never touches their session state, same intent as
+# a fresh Playwright browser context.
+AUTOMATION_PROFILE = Path.home() / ".config" / "browser-harness" / "automation-profile"
+
 class StalePage(ValueError):
     """A decision no longer refers to the observed page."""
 
 
+def _chrome_binary():
+    for key in ("BH_CHROME_PATH", "CHROME_PATH"):
+        if path := os.environ.get(key):
+            return path
+    system = platform.system()
+    if system == "Darwin":
+        return "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    if system == "Windows":
+        return shutil.which("chrome") or r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+    for name in ("google-chrome-stable", "google-chrome", "chromium", "chromium-browser"):
+        if found := shutil.which(name):
+            return found
+    raise RuntimeError("no Chrome binary found; set CHROME_PATH")
+
+
+def _cdp_port_live(host, port):
+    try:
+        urllib.request.urlopen(f"http://{host}:{port}/json/version", timeout=1)
+        return True
+    except OSError:
+        return False
+
+
+def ensure_automation_chrome():
+    """Launch the dedicated automation Chrome behind BU_CDP_URL if it isn't up.
+
+    No-op unless BU_CDP_URL is set, so a real local Chrome profile stays usable
+    for anyone who hasn't opted into the isolated profile.
+    """
+    url = os.environ.get("BU_CDP_URL")
+    if not url:
+        return
+    parsed = urlparse(url)
+    host, port = parsed.hostname or "127.0.0.1", parsed.port or 9333
+    if _cdp_port_live(host, port):
+        return
+    AUTOMATION_PROFILE.mkdir(parents=True, exist_ok=True)
+    subprocess.Popen(
+        [
+            _chrome_binary(),
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={AUTOMATION_PROFILE}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "about:blank",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if _cdp_port_live(host, port):
+            return
+        time.sleep(0.2)
+    raise RuntimeError(f"automation Chrome did not come up on {host}:{port}")
+
+
 class Browser:
     def __init__(self, url):
+        ensure_automation_chrome()
         ensure_daemon()
         self.target = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
         self.session = cdp("Target.attachToTarget", targetId=self.target, flatten=True)["sessionId"]
